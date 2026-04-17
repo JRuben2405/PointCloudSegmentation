@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
+from plotly.offline import get_plotlyjs
 
 try:
     from core.bag_reader import BagReaderError, ScanResult, iter_topic_messages, scan_bag
@@ -139,6 +141,8 @@ def _init_state() -> None:
         "seg_preview_max_points": 50000,
         "seg_preview_use_downsampling": False,
         "seg_chart_nonce": 0,
+        "seg_class_color_signature": None,
+        "seg_class_visibility_signature": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -215,6 +219,47 @@ def _inject_styles() -> None:
         .step-title {
             font-size: 1.05rem;
             font-weight: 600;
+        }
+
+        /* ── Segmentation class rows ── */
+        .seg-class-row {
+            min-height: 3.15rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .seg-class-row.inactive {
+            opacity: 0.48;
+        }
+        .seg-class-title {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            font-weight: 600;
+            line-height: 1.15;
+        }
+        .seg-class-dot {
+            display: inline-block;
+            width: 0.8rem;
+            height: 0.8rem;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            flex-shrink: 0;
+        }
+        .seg-class-meta {
+            margin-left: 1.35rem;
+            margin-top: 0.12rem;
+            font-size: 0.82rem;
+            opacity: 0.72;
+        }
+        .seg-class-divider {
+            height: 1px;
+            background: rgba(128, 128, 128, 0.14);
+            margin: 0.28rem 0 0.45rem 0;
+        }
+        [data-testid="stColorPicker"] {
+            transform: scale(0.82);
+            transform-origin: center center;
         }
 
         /* ── Sidebar ── */
@@ -495,6 +540,124 @@ def _build_output_browser_state() -> OutputBrowserState:
         export_dirs=export_dirs,
         selected_export_dir=selected_export_dir,
     )
+
+
+@st.cache_resource(show_spinner=False)
+def _get_plotly_js_bundle() -> str:
+    return get_plotlyjs()
+
+
+def _render_persistent_plotly_chart(
+    fig: go.Figure,
+    *,
+    storage_key: str,
+    height: int | None = None,
+) -> None:
+    html = _build_persistent_plotly_html(fig, storage_key=storage_key)
+    chart_height = height
+    if chart_height is None:
+        chart_height = int(fig.layout.height) if fig.layout.height is not None else 720
+    components.html(html, height=chart_height + 8, scrolling=False)
+
+
+def _build_persistent_plotly_html(
+    fig: go.Figure,
+    *,
+    storage_key: str,
+) -> str:
+    plot_height = int(fig.layout.height) if fig.layout.height is not None else 720
+    plot_div_id = f"plotly-{re.sub(r'[^a-zA-Z0-9_-]+', '-', storage_key)}"
+    figure_json = fig.to_json().replace("</script>", "<\\/script>")
+    plotly_js = _get_plotly_js_bundle().replace("</script>", "<\\/script>")
+    config_json = json.dumps({"displaylogo": False, "responsive": True})
+    storage_key_json = json.dumps(storage_key)
+    plot_div_id_json = json.dumps(plot_div_id)
+    plot_height_px = json.dumps(f"{plot_height}px")
+
+    return f"""
+    <div id={plot_div_id_json} style="width: 100%; height: {plot_height_px};"></div>
+    <script>{plotly_js}</script>
+    <script>
+    const storageKey = {storage_key_json};
+    const plotDiv = document.getElementById({plot_div_id_json});
+    const figure = {figure_json};
+    const config = {config_json};
+
+    function cloneValue(value) {{
+        return value ? JSON.parse(JSON.stringify(value)) : null;
+    }}
+
+    function readSavedCamera() {{
+        try {{
+            const raw = window.localStorage.getItem(storageKey);
+            return raw ? JSON.parse(raw) : null;
+        }} catch (error) {{
+            return null;
+        }}
+    }}
+
+    function writeSavedCamera(camera) {{
+        try {{
+            window.localStorage.setItem(storageKey, JSON.stringify(camera));
+        }} catch (error) {{
+            return;
+        }}
+    }}
+
+    function mergeCameraUpdate(currentCamera, eventData) {{
+        if (!eventData) {{
+            return null;
+        }}
+        if (eventData["scene.camera"]) {{
+            return cloneValue(eventData["scene.camera"]);
+        }}
+
+        const nextCamera = cloneValue(currentCamera) || {{}};
+        let changed = false;
+        for (const section of ["center", "eye", "up"]) {{
+            for (const axis of ["x", "y", "z"]) {{
+                const key = `scene.camera.${{section}}.${{axis}}`;
+                if (eventData[key] !== undefined) {{
+                    nextCamera[section] = nextCamera[section] || {{}};
+                    nextCamera[section][axis] = eventData[key];
+                    changed = true;
+                }}
+            }}
+        }}
+        const projectionKey = "scene.camera.projection.type";
+        if (eventData[projectionKey] !== undefined) {{
+            nextCamera.projection = nextCamera.projection || {{}};
+            nextCamera.projection.type = eventData[projectionKey];
+            changed = true;
+        }}
+        return changed ? nextCamera : null;
+    }}
+
+    const savedCamera = readSavedCamera();
+    if (savedCamera) {{
+        figure.layout = figure.layout || {{}};
+        figure.layout.scene = figure.layout.scene || {{}};
+        figure.layout.scene.camera = savedCamera;
+    }}
+
+    Plotly.newPlot(plotDiv, figure.data, figure.layout, config).then((gd) => {{
+        let currentCamera = cloneValue(savedCamera || figure.layout?.scene?.camera);
+
+        gd.on("plotly_relayout", (eventData) => {{
+            const nextCamera = mergeCameraUpdate(currentCamera, eventData);
+            if (!nextCamera) {{
+                return;
+            }}
+            currentCamera = nextCamera;
+            writeSavedCamera(currentCamera);
+        }});
+
+        const resizePlot = () => Plotly.Plots.resize(gd);
+        window.addEventListener("resize", resizePlot);
+        requestAnimationFrame(resizePlot);
+    }});
+    </script>
+    """
 
 
 def _render_global_messages() -> None:
@@ -1005,73 +1168,76 @@ def _render_segment_page(output_state: OutputBrowserState) -> None:
         st.info("No se encontraron exportaciones con archivos .pcd. Convierta un rosbag primero.")
         return
 
-    # ── Step 1: Seleccionar PCD ──
-    _render_step_header(1, "Seleccionar nube de puntos")
+    selection_col, model_col = st.columns(2, gap="large")
 
-    with st.container(border=True):
-        selected_export_dir = _render_export_directory_selector(
-            output_state,
-            widget_key="seg_export_selector",
-            label="Carpeta de exportacion",
-        )
-        details = _load_export_details(selected_export_dir)
-        if not details.pcd_files:
-            st.warning("La carpeta seleccionada no contiene archivos .pcd.")
-            return
+    with selection_col:
+        # ── Step 1: Seleccionar PCD ──
+        _render_step_header(1, "Seleccionar nube de puntos")
 
-        file_names = [p.name for p in details.pcd_files]
-        selected_file = st.selectbox(
-            "Archivo PCD",
-            options=file_names,
-            key="seg_selected_pcd",
-            help=f"{len(file_names)} archivos disponibles.",
-        )
-        selected_pcd_path = details.export_dir / selected_file
-
-    # ── Step 2: Seleccionar modelo ──
-    _render_step_header(2, "Seleccionar modelo")
-
-    with st.container(border=True):
-        model_dir_col, browse_col = st.columns([3.7, 0.3])
-        default_model_dir = str(Path(__file__).parent / "models")
-        model_dir_col.text_input(
-            "Directorio del modelo",
-            key="seg_model_dir",
-            placeholder=default_model_dir,
-            help="Carpeta con el modelo ONNX y los archivos arch_cfg.yaml / data_cfg.yaml.",
-        )
-        if browse_col.button(":material/folder_open:", key="browse_model_dir_btn"):
-            _file_browser_dialog("seg_model_dir", "directory")
-
-        model_dir_raw = st.session_state.get("seg_model_dir", "").strip()
-        if not model_dir_raw:
-            model_dir_raw = str(Path(__file__).parent / "models")
-        model_dir = Path(model_dir_raw)
-        onnx_files = sorted(model_dir.glob("*.onnx")) if model_dir.is_dir() else []
-
-        if not onnx_files:
-            st.warning("No se encontraron archivos .onnx en el directorio seleccionado.")
-            return
-
-        onnx_names = [f.name for f in onnx_files]
-        selected_onnx = st.selectbox(
-            "Modelo ONNX",
-            options=onnx_names,
-            key="seg_selected_onnx",
-        )
-        model_path = model_dir / selected_onnx
-
-        try:
-            seg_config = load_configs(model_dir)
-            train_labels = seg_config.train_id_labels
-            train_colors = seg_config.train_id_colors
-            label_chips = " ".join(
-                f"`{tid}: {name}`" for tid, name in train_labels.items()
+        with st.container(border=True):
+            selected_export_dir = _render_export_directory_selector(
+                output_state,
+                widget_key="seg_export_selector",
+                label="Carpeta de exportacion",
             )
-            st.caption(f"Clases: {label_chips}")
-        except SegmentationError as exc:
-            st.error(str(exc))
-            return
+            details = _load_export_details(selected_export_dir)
+            if not details.pcd_files:
+                st.warning("La carpeta seleccionada no contiene archivos .pcd.")
+                return
+
+            file_names = [p.name for p in details.pcd_files]
+            selected_file = st.selectbox(
+                "Archivo PCD",
+                options=file_names,
+                key="seg_selected_pcd",
+                help=f"{len(file_names)} archivos disponibles.",
+            )
+            selected_pcd_path = details.export_dir / selected_file
+
+    with model_col:
+        # ── Step 2: Seleccionar modelo ──
+        _render_step_header(2, "Seleccionar modelo")
+
+        with st.container(border=True):
+            model_dir_col, browse_col = st.columns([3.7, 0.3])
+            default_model_dir = str(Path(__file__).parent / "models")
+            model_dir_col.text_input(
+                "Directorio del modelo",
+                key="seg_model_dir",
+                placeholder=default_model_dir,
+                help="Carpeta con el modelo ONNX y los archivos arch_cfg.yaml / data_cfg.yaml.",
+            )
+            browse_col.markdown("<div style='height: 1.8rem;'></div>", unsafe_allow_html=True)
+            if browse_col.button(
+                ":material/folder_open:",
+                key="browse_model_dir_btn",
+                use_container_width=True,
+            ):
+                _file_browser_dialog("seg_model_dir", "directory")
+
+            model_dir_raw = st.session_state.get("seg_model_dir", "").strip()
+            if not model_dir_raw:
+                model_dir_raw = str(Path(__file__).parent / "models")
+            model_dir = Path(model_dir_raw)
+            onnx_files = sorted(model_dir.glob("*.onnx")) if model_dir.is_dir() else []
+
+            if not onnx_files:
+                st.warning("No se encontraron archivos .onnx en el directorio seleccionado.")
+                return
+
+            onnx_names = [f.name for f in onnx_files]
+            selected_onnx = st.selectbox(
+                "Modelo ONNX",
+                options=onnx_names,
+                key="seg_selected_onnx",
+            )
+            model_path = model_dir / selected_onnx
+
+            try:
+                seg_config = load_configs(model_dir)
+            except SegmentationError as exc:
+                st.error(str(exc))
+                return
 
     # ── Step 3: Ejecutar segmentacion ──
     _render_step_header(3, "Ejecutar segmentacion")
@@ -1123,6 +1289,9 @@ def _handle_segmentation(
         f"de {result.num_points:,} totales."
     )
 
+    # Reset per-result viewer defaults so the controls start from a consistent baseline.
+    st.session_state["seg_preview_point_size"] = 2.0
+
     st.session_state["seg_last_result"] = {
         "pcd_path": str(pcd_path),
         "labels": result.labels,
@@ -1143,31 +1312,25 @@ def _render_segmentation_result(
     train_labels = config.train_id_labels
     class_counts = seg_result["class_counts"]
 
-    cards = []
-    for tid, name in train_labels.items():
-        if tid == 0:
-            continue
-        count = class_counts.get(tid, 0)
-        pct = (count / seg_result["num_points"] * 100) if seg_result["num_points"] else 0
-        tone = "ready" if count > 0 else "pending"
-        cards.append({
-            "label": name.capitalize(),
-            "value": f"{count:,}",
-            "detail": f"{pct:.1f}%",
-            "tone": tone,
-        })
-    _render_stat_cards(cards)
-
-    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
-
     controls_col, viewer_col = st.columns([1.05, 1.95], gap="large")
 
     xyz = seg_result["xyz"]
     labels = seg_result["labels"]
     num_points = xyz.shape[0]
+    class_colors = _get_segmentation_class_colors(config)
+    class_visibility = _get_segmentation_class_visibility(config)
 
     with controls_col:
         st.markdown("##### :material/tune: Controles")
+        with st.expander(":material/category: Clases", expanded=True):
+            class_colors, class_visibility = _render_segmentation_class_controls(
+                train_labels=train_labels,
+                class_counts=class_counts,
+                num_points=num_points,
+                class_colors=class_colors,
+                class_visibility=class_visibility,
+            )
+
         with st.expander(":material/filter_alt: Muestreo", expanded=True):
             use_ds = st.checkbox(
                 "Downsampling",
@@ -1204,18 +1367,6 @@ def _render_segmentation_result(
             ):
                 st.session_state["seg_chart_nonce"] += 1
 
-        with st.expander(":material/info: Distribucion de clases"):
-            rows = []
-            for tid, name in train_labels.items():
-                count = class_counts.get(tid, 0)
-                pct = (count / num_points * 100) if num_points else 0
-                rows.append({
-                    "clase": name,
-                    "puntos": count,
-                    "porcentaje": f"{pct:.1f}%",
-                })
-            st.dataframe(rows, use_container_width=True)
-
     sample_xyz, sample_labels = _sample_segmentation(xyz, labels, max_pts)
 
     with viewer_col:
@@ -1224,17 +1375,19 @@ def _render_segmentation_result(
             sample_xyz,
             sample_labels,
             config,
+            class_colors=class_colors,
+            class_visibility=class_visibility,
             point_size=float(st.session_state["seg_preview_point_size"]),
             background_mode=st.session_state["seg_preview_background"],
             show_bounds=bool(st.session_state["seg_preview_show_bounds"]),
             camera_nonce=int(st.session_state["seg_chart_nonce"]),
         )
-        st.plotly_chart(
+        _render_persistent_plotly_chart(
             fig,
-            key=f"seg-chart-{st.session_state['seg_chart_nonce']}",
-            use_container_width=True,
-            theme=None,
-            config={"displaylogo": False, "responsive": True},
+            storage_key=(
+                f"forestseg-seg-camera-{seg_result['pcd_path']}-"
+                f"{st.session_state['seg_chart_nonce']}"
+            ),
         )
 
 
@@ -1255,6 +1408,8 @@ def _build_segmentation_figure(
     labels: np.ndarray,
     config: SegmentationConfig,
     *,
+    class_colors: dict[int, list[int]],
+    class_visibility: dict[int, bool],
     point_size: float,
     background_mode: str,
     show_bounds: bool,
@@ -1262,25 +1417,27 @@ def _build_segmentation_figure(
 ) -> go.Figure:
     background = _resolve_background_palette(background_mode)
     train_labels = config.train_id_labels
-    train_colors = config.train_id_colors
 
     fig = go.Figure()
 
     for tid in sorted(train_labels.keys()):
+        if not class_visibility.get(tid, True):
+            continue
         mask = labels == tid
         if not np.any(mask):
             continue
-        rgb = train_colors.get(tid, [160, 160, 160])
+        rgb = class_colors.get(tid, [160, 160, 160])
         color_str = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
         pts = xyz[mask]
+        label = _format_class_display_name(train_labels[tid])
         fig.add_trace(go.Scatter3d(
             x=pts[:, 0],
             y=pts[:, 1],
             z=pts[:, 2],
             mode="markers",
-            name=train_labels[tid],
+            name=label,
             marker={"size": point_size, "opacity": 0.85, "color": color_str},
-            hovertemplate=f"{train_labels[tid]}<br>x=%{{x:.3f}}<br>y=%{{y:.3f}}<br>z=%{{z:.3f}}<extra></extra>",
+            hovertemplate=f"{label}<br>x=%{{x:.3f}}<br>y=%{{y:.3f}}<br>z=%{{z:.3f}}<extra></extra>",
         ))
 
     if show_bounds and xyz.shape[0] > 0:
@@ -1298,6 +1455,7 @@ def _build_segmentation_figure(
         legend={"itemsizing": "constant"},
         uirevision=f"seg-view-{camera_nonce}",
         scene={
+            "uirevision": f"seg-view-{camera_nonce}",
             "aspectmode": "data",
             "bgcolor": background["scene"],
             "xaxis": {
@@ -1535,7 +1693,7 @@ def _render_pcd_directory_viewer(details: ExportDirectoryDetails) -> None:
 
     with viewer_col:
         st.markdown("##### :material/view_in_ar: Visor 3D")
-        st.plotly_chart(
+        _render_persistent_plotly_chart(
             _build_pcd_figure(
                 preview,
                 color_mode=color_mode,
@@ -1544,10 +1702,10 @@ def _render_pcd_directory_viewer(details: ExportDirectoryDetails) -> None:
                 show_bounds=bool(st.session_state["pcd_preview_show_bounds"]),
                 camera_nonce=int(st.session_state["pcd_preview_chart_nonce"]),
             ),
-            key=f"pcd-chart-{st.session_state['pcd_preview_chart_nonce']}",
-            use_container_width=True,
-            theme=None,
-            config={"displaylogo": False, "responsive": True},
+            storage_key=(
+                f"forestseg-pcd-camera-{selected_path.resolve()}-"
+                f"{st.session_state['pcd_preview_chart_nonce']}"
+            ),
         )
 
 
@@ -1615,6 +1773,7 @@ def _build_pcd_figure(
         showlegend=show_bounds,
         uirevision=f"pcd-view-{camera_nonce}",
         scene={
+            "uirevision": f"pcd-view-{camera_nonce}",
             "aspectmode": "data",
             "bgcolor": background["scene"],
             "xaxis": {
@@ -1690,6 +1849,141 @@ def _build_bbox_trace(bounds_min: np.ndarray, bounds_max: np.ndarray, color: str
         line={"color": color, "width": 4},
         hoverinfo="skip",
     )
+
+
+def _render_segmentation_class_controls(
+    *,
+    train_labels: dict[int, str],
+    class_counts: dict[int, int],
+    num_points: int,
+    class_colors: dict[int, list[int]],
+    class_visibility: dict[int, bool],
+) -> tuple[dict[int, list[int]], dict[int, bool]]:
+    visible_classes = sorted(train_labels.keys())
+
+    for index, tid in enumerate(visible_classes):
+        count = class_counts.get(tid, 0)
+        pct = (count / num_points * 100) if num_points else 0.0
+        color_hex = _rgb_to_hex(class_colors.get(tid, [160, 160, 160]))
+        is_active = class_visibility.get(tid, True)
+        row_class = "seg-class-row" if is_active else "seg-class-row inactive"
+        display_name = _format_class_display_name(train_labels[tid])
+        info_col, toggle_col, picker_col = st.columns(
+            [2.12, 0.34, 0.40],
+            gap="small",
+            vertical_alignment="center",
+        )
+
+        info_col.markdown(
+            f"""
+            <div class="{row_class}">
+              <div class="seg-class-title">
+                <span class="seg-class-dot" style="background:{color_hex};"></span>
+                <span>{display_name}</span>
+              </div>
+              <div class="seg-class-meta">{count:,} puntos · {pct:.1f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        toggle_col.toggle(
+            f"Mostrar {display_name}",
+            key=f"seg_class_visible_{tid}",
+            label_visibility="collapsed",
+        )
+        picker_col.color_picker(
+            f"Color {display_name}",
+            key=f"seg_class_color_{tid}",
+            label_visibility="collapsed",
+        )
+        if index < len(visible_classes) - 1:
+            st.markdown('<div class="seg-class-divider"></div>', unsafe_allow_html=True)
+
+    return (
+        _get_segmentation_class_colors_from_state(train_labels),
+        _get_segmentation_class_visibility_from_state(train_labels),
+    )
+
+
+def _get_segmentation_class_colors(config: SegmentationConfig) -> dict[int, list[int]]:
+    default_colors = config.train_id_colors
+    signature = tuple(
+        (
+            tid,
+            config.train_id_labels[tid],
+            tuple(default_colors.get(tid, [160, 160, 160])),
+        )
+        for tid in sorted(config.train_id_labels.keys())
+    )
+
+    if st.session_state.get("seg_class_color_signature") != signature:
+        for tid in sorted(config.train_id_labels.keys()):
+            st.session_state[f"seg_class_color_{tid}"] = _rgb_to_hex(
+                default_colors.get(tid, [160, 160, 160])
+            )
+        st.session_state["seg_class_color_signature"] = signature
+
+    for tid in sorted(config.train_id_labels.keys()):
+        key = f"seg_class_color_{tid}"
+        st.session_state.setdefault(
+            key,
+            _rgb_to_hex(default_colors.get(tid, [160, 160, 160])),
+        )
+    return _get_segmentation_class_colors_from_state(config.train_id_labels)
+
+
+def _get_segmentation_class_visibility(config: SegmentationConfig) -> dict[int, bool]:
+    signature = tuple(
+        (tid, config.train_id_labels[tid])
+        for tid in sorted(config.train_id_labels.keys())
+    )
+
+    if st.session_state.get("seg_class_visibility_signature") != signature:
+        for tid in sorted(config.train_id_labels.keys()):
+            st.session_state[f"seg_class_visible_{tid}"] = True
+        st.session_state["seg_class_visibility_signature"] = signature
+
+    for tid in sorted(config.train_id_labels.keys()):
+        key = f"seg_class_visible_{tid}"
+        st.session_state.setdefault(key, True)
+    return _get_segmentation_class_visibility_from_state(config.train_id_labels)
+
+
+def _get_segmentation_class_colors_from_state(train_labels: dict[int, str]) -> dict[int, list[int]]:
+    resolved_colors: dict[int, list[int]] = {}
+    for tid in sorted(train_labels.keys()):
+        resolved_colors[tid] = _hex_to_rgb(
+            st.session_state.get(f"seg_class_color_{tid}", "#a0a0a0")
+        )
+    return resolved_colors
+
+
+def _get_segmentation_class_visibility_from_state(train_labels: dict[int, str]) -> dict[int, bool]:
+    resolved_visibility: dict[int, bool] = {}
+    for tid in sorted(train_labels.keys()):
+        resolved_visibility[tid] = bool(
+            st.session_state.get(f"seg_class_visible_{tid}", True)
+        )
+    return resolved_visibility
+
+
+def _format_class_display_name(name: str) -> str:
+    return str(name).replace("_", " ").title()
+
+
+def _rgb_to_hex(rgb: list[int]) -> str:
+    red, green, blue = (max(0, min(int(value), 255)) for value in rgb[:3])
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _hex_to_rgb(color: str) -> list[int]:
+    cleaned = str(color).strip().lstrip("#")
+    if len(cleaned) != 6:
+        return [160, 160, 160]
+    try:
+        return [int(cleaned[index:index + 2], 16) for index in (0, 2, 4)]
+    except ValueError:
+        return [160, 160, 160]
 
 
 def _resolve_pcd_colors(preview: PCDPreviewData, *, color_mode: str) -> tuple[np.ndarray, str]:

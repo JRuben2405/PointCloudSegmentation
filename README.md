@@ -38,6 +38,7 @@ La funcionalidad principal de segmentacion espera que `app/models/` contenga al 
 - un archivo `.onnx`
 - si el modelo usa pesos externos, su archivo `.onnx.data` asociado
 
+Puedes descargar un modelo de ejemplo [aqui](https://drive.google.com/file/d/1SvrIndkkDqSgvzGWsLDDJI8CrQMsAnHn/view?usp=sharing).
 
 ## Instalacion
 
